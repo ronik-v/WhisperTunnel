@@ -1,7 +1,13 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
+use tokio::sync::mpsc;
+use tokio_tungstenite::{
+    accept_async,
+    tungstenite::{Bytes, Message},
+    WebSocketStream,
+};
 
 use crate::tunnel::interface::ServerTunnel;
 use crate::utils::get_current_date;
@@ -49,18 +55,24 @@ impl ServerTunnel for WebSocketTunnel {
                     }
                 };
 
-                if let Err(e) = tunnel.handle_connection(ws_stream).await {
-                    eprintln!("{} [ERROR] Connection handler failed for {}: {}",
-                              get_current_date(), addr, e);
-                }
+                let _ = tunnel.handle_connection(ws_stream).await;
             });
         }
     }
 
     async fn handle_connection(&self, transport: Self::Transport) -> Result<(), Self::Error> {
-        let (mut write, mut read) = transport.split();
+        let (mut ws_write, mut ws_read) = transport.split();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
-        while let Some(msg_result) = read.next().await {
+        let writer_task = tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if ws_write.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        while let Some(msg_result) = ws_read.next().await {
             let msg = match msg_result {
                 Ok(m) => m,
                 Err(e) => {
@@ -69,24 +81,83 @@ impl ServerTunnel for WebSocketTunnel {
                 }
             };
 
-            self.process_message(msg.clone()).await?;
+            match msg {
+                Message::Binary(data) => {
+                    let tunnel = self.clone();
+                    let tx_clone = tx.clone();
 
-            if let Err(e) = write.send(msg).await {
-                eprintln!("{} [ERROR] Write error: {}", get_current_date(), e);
-                break;
+                    tokio::spawn(async move {
+                        let _ = tunnel.process_message(data, tx_clone).await;
+                    });
+                }
+                Message::Close(_) => break,
+                _ => {}
             }
         }
+
+        drop(tx);
+        let _ = writer_task.await;
 
         Ok(())
     }
 
-    async fn process_message(&self, msg: Self::Message) -> Result<Option<Self::Message>, Self::Error> {
-        match &msg {
-            Message::Text(text) => println!("{} [INFO] Received text: {}", get_current_date(), text),
-            Message::Binary(data) => println!("{} [INFO] Received binary: {} bytes", get_current_date(), data.len()),
-            Message::Close(_) => println!("{} [INFO] Client closed connection", get_current_date()),
-            _ => {}
+    async fn process_message(
+        &self,
+        data: Bytes,
+        tx: mpsc::UnboundedSender<Message>,
+    ) -> Result<(), Self::Error> {
+        if data.len() < 6 {
+            return Ok(());
         }
-        Ok(Some(msg))
+
+        let target_ip = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let target_port = u16::from_be_bytes([data[4], data[5]]);
+        let payload = &data[6..];
+
+        let target_addr = format!(
+            "{}.{}.{}.{}:{}",
+            (target_ip >> 24) & 0xff,
+            (target_ip >> 16) & 0xff,
+            (target_ip >> 8) & 0xff,
+            target_ip & 0xff,
+            target_port
+        );
+
+        println!("{} [INFO] Forwarding to {}", get_current_date(), target_addr);
+
+        let mut remote = match TcpStream::connect(&target_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{} [ERROR] Failed to connect to {}: {}", get_current_date(), target_addr, e);
+                return Ok(());
+            }
+        };
+
+        if !payload.is_empty() {
+            if let Err(e) = remote.write_all(payload).await {
+                eprintln!("{} [ERROR] Failed to write payload to {}: {}", get_current_date(), target_addr, e);
+                return Ok(());
+            }
+        }
+
+        let (mut remote_read, _remote_write) = remote.into_split();
+        let mut buf = [0u8; 8192];
+
+        loop {
+            match remote_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(Message::Binary(Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{} [ERROR] Remote read error: {}", get_current_date(), e);
+                    break;
+                }
+            }
+        }
+
+        Ok(())
     }
 }

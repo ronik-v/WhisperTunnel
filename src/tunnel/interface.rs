@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_tungstenite::{tungstenite::{Bytes, Message}};
 
 #[async_trait]
 pub trait ServerTunnel: Send + Sync + 'static {
@@ -13,5 +15,9 @@ pub trait ServerTunnel: Send + Sync + 'static {
 
     async fn handle_connection(&self, transport: Self::Transport) -> Result<(), Self::Error>;
 
-    async fn process_message(&self, msg: Self::Message) -> Result<Option<Self::Message>, Self::Error>;
+    async fn process_message(
+        &self,
+        data: Bytes,
+        tx: mpsc::UnboundedSender<Message>,
+    ) -> Result<(), Self::Error>;
 }
