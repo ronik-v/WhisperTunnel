@@ -4,16 +4,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
-    accept_async,
-    tungstenite::{Bytes, Message},
+    accept_hdr_async,
+    tungstenite::{Bytes, Message, handshake::server::{Request, Response}},
     WebSocketStream,
 };
 
 use crate::tunnel::interface::ServerTunnel;
 use crate::utils::get_current_date;
+use crate::auth::services::AuthService;
+use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct WebSocketTunnel;
+pub struct WebSocketTunnel {
+    auth_service: Arc<AuthService>,
+}
+
+impl WebSocketTunnel {
+    pub fn new(auth_service: Arc<AuthService>) -> Self {
+        Self { auth_service }
+    }
+}
 
 #[async_trait]
 impl ServerTunnel for WebSocketTunnel {
@@ -47,7 +57,26 @@ impl ServerTunnel for WebSocketTunnel {
 
             let tunnel = self.clone();
             tokio::spawn(async move {
-                let ws_stream = match accept_async(tcp_stream).await {
+                let ws_stream = match accept_hdr_async(tcp_stream, |req: &Request, _response: Response| {
+                    if let Some(cookie) = req.headers().get("cookie") {
+                        if let Ok(cookie_str) = cookie.to_str() {
+                            if let Some(token_part) = cookie_str.split(';').find(|s| s.trim().starts_with("token=")) {
+                                let token = token_part.trim().trim_start_matches("token=").trim();
+                                if !token.is_empty() {
+                                    if let Ok(true) = futures::executor::block_on(tunnel.auth_service.verify_token(token)) {
+                                        return Ok(Response::default());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(
+                        Response::builder()
+                            .status(401)
+                            .body(Some("Missing or invalid token".to_string()))
+                            .unwrap()
+                    )
+                }).await {
                     Ok(ws) => ws,
                     Err(e) => {
                         eprintln!("{} [ERROR] WebSocket handshake failed: {}", get_current_date(), e);

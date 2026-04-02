@@ -30,13 +30,13 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/api/auth", axum::routing::post(auth::controllers::login))
-        .with_state(auth_service);
+        .with_state(auth_service.clone());
 
-    let ws_listener = WebSocketTunnel.init(config.host.clone(), config.web_socket_port).await?;
+    let ws_tunnel = WebSocketTunnel::new(auth_service.clone());
+    let ws_listener = ws_tunnel.init(config.host.clone(), config.web_socket_port).await?;
 
-    let tunnel = WebSocketTunnel;
     tokio::spawn(async move {
-        let _ = tunnel.run(ws_listener).await;
+        let _ = ws_tunnel.run(ws_listener).await;
     });
 
     let http_listener = TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
