@@ -1,25 +1,49 @@
 mod tunnel;
 mod utils;
+mod auth;
+mod config;
 
+use std::sync::Arc;
 use tokio::net::TcpListener;
-use anyhow::{Result, Error};
+use anyhow::Result;
+use axum::Router;
+
+use crate::auth::services::AuthService;
+use crate::config::AppConfig;
 
 use crate::tunnel::interface::ServerTunnel;
 use crate::tunnel::ws_server::WebSocketTunnel;
-use crate::utils::get_current_date;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let host: String = "localhost".to_string();
-    let port: u16 = 9090;
+    let config = AppConfig::from_env();
 
-    let tunnel: Result<TcpListener, Error> = WebSocketTunnel.init(host, port).await;
-    match tunnel {
-        Ok(tun) => {
-            WebSocketTunnel.run(tun).await?;
+    let pool = match sqlx::PgPool::connect(&config.database_uri).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to connect to database: {}", e);
+            return Err(e.into());
         }
-        Err(err) => { println!("{} [ERROR] Bad connection - {}", get_current_date(), err) }
-    }
+    };
+
+    let auth_service = Arc::new(AuthService::new(pool, config.clone()));
+
+    let app = Router::new()
+        .route("/api/auth", axum::routing::post(auth::controllers::login))
+        .with_state(auth_service);
+
+    let ws_listener = WebSocketTunnel.init(config.host.clone(), config.web_socket_port).await?;
+
+    let tunnel = WebSocketTunnel;
+    tokio::spawn(async move {
+        let _ = tunnel.run(ws_listener).await;
+    });
+
+    let http_listener = TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
+    println!("Auth server running on http://localhost:{}", config.port);
+    println!("WebSocket tunnel running on ws://localhost:{}", config.web_socket_port);
+
+    axum::serve(http_listener, app).await?;
 
     Ok(())
 }
