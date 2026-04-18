@@ -55,6 +55,12 @@ impl AuthService {
     }
 
     pub async fn verify_token(&self, token: &str) -> Result<bool> {
+        sqlx::query(
+            "DELETE FROM user_tokens WHERE created_at < NOW() - INTERVAL '3 days'"
+        )
+            .execute(&self.pool)
+            .await?;
+
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM user_tokens WHERE token = $1)"
         )

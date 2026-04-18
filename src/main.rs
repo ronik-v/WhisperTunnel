@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
             return Err(e.into());
         }
     };
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     let auth_service = Arc::new(AuthService::new(pool, config.clone()));
 

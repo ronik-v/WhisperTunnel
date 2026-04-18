@@ -1,18 +1,19 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{
-    accept_hdr_async,
-    tungstenite::{Bytes, Message, handshake::server::{Request, Response}},
+    accept_async,
+    tungstenite::{Bytes, Message},
     WebSocketStream,
 };
 
 use crate::tunnel::interface::ServerTunnel;
 use crate::utils::get_current_date;
 use crate::auth::services::AuthService;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct WebSocketTunnel {
@@ -57,33 +58,13 @@ impl ServerTunnel for WebSocketTunnel {
 
             let tunnel = self.clone();
             tokio::spawn(async move {
-                let ws_stream = match accept_hdr_async(tcp_stream, |req: &Request, _response: Response| {
-                    if let Some(cookie) = req.headers().get("cookie") {
-                        if let Ok(cookie_str) = cookie.to_str() {
-                            if let Some(token_part) = cookie_str.split(';').find(|s| s.trim().starts_with("token=")) {
-                                let token = token_part.trim().trim_start_matches("token=").trim();
-                                if !token.is_empty() {
-                                    if let Ok(true) = futures::executor::block_on(tunnel.auth_service.verify_token(token)) {
-                                        return Ok(Response::default());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(
-                        Response::builder()
-                            .status(401)
-                            .body(Some("Missing or invalid token".to_string()))
-                            .unwrap()
-                    )
-                }).await {
+                let ws_stream = match accept_async(tcp_stream).await {
                     Ok(ws) => ws,
                     Err(e) => {
                         eprintln!("{} [ERROR] WebSocket handshake failed: {}", get_current_date(), e);
                         return;
                     }
                 };
-
                 let _ = tunnel.handle_connection(ws_stream).await;
             });
         }
@@ -93,6 +74,8 @@ impl ServerTunnel for WebSocketTunnel {
         let (mut ws_write, mut ws_read) = transport.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
+        let streams: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Bytes>>>> = Arc::new(Mutex::new(HashMap::new()));
+
         let writer_task = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if ws_write.send(msg).await.is_err() {
@@ -101,90 +84,165 @@ impl ServerTunnel for WebSocketTunnel {
             }
         });
 
+        let token = match ws_read.next().await {
+            Some(Ok(Message::Text(token))) => token,
+            _ => {
+                eprintln!("{} [ERROR] First message must be token", get_current_date());
+                return Ok(());
+            }
+        };
+
+        if !self.auth_service.verify_token(&token).await.unwrap_or(false) {
+            eprintln!("{} [ERROR] Invalid token", get_current_date());
+            return Ok(());
+        }
+
+        println!("{} [INFO] Token accepted. Multiplexing ready for production.", get_current_date());
+
         while let Some(msg_result) = ws_read.next().await {
             let msg = match msg_result {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("{} [ERROR] Read error: {}", get_current_date(), e);
+                    eprintln!("{} [ERROR] WS read error: {}", get_current_date(), e);
                     break;
                 }
             };
 
-            match msg {
-                Message::Binary(data) => {
-                    let tunnel = self.clone();
-                    let tx_clone = tx.clone();
+            if let Message::Binary(data) = msg {
+                let tunnel = self.clone();
+                let tx_clone = tx.clone();
+                let streams_clone = streams.clone();
 
-                    tokio::spawn(async move {
-                        let _ = tunnel.process_message(data, tx_clone).await;
-                    });
-                }
-                Message::Close(_) => break,
-                _ => {}
+                tokio::spawn(async move {
+                    let _ = tunnel.process_packet(data, tx_clone, streams_clone).await;
+                });
             }
         }
 
         drop(tx);
         let _ = writer_task.await;
+        let mut map = streams.lock().await;
+        map.clear();
 
+        println!("{} [INFO] WebSocket connection closed, all streams cleaned", get_current_date());
         Ok(())
     }
 
-    async fn process_message(
+    async fn process_packet(
         &self,
         data: Bytes,
         tx: mpsc::UnboundedSender<Message>,
+        streams: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Bytes>>>>,
     ) -> Result<(), Self::Error> {
-        if data.len() < 6 {
+        if data.len() < 5 {
+            let _ = tx.send(Message::Binary(Bytes::from_static(b"ERROR: INVALID_HEADER")));
             return Ok(());
         }
 
-        let target_ip = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        let target_port = u16::from_be_bytes([data[4], data[5]]);
-        let payload = &data[6..];
+        let stream_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let cmd = data[4];
+        let payload = &data[5..];
 
-        let target_addr = format!(
-            "{}.{}.{}.{}:{}",
-            (target_ip >> 24) & 0xff,
-            (target_ip >> 16) & 0xff,
-            (target_ip >> 8) & 0xff,
-            target_ip & 0xff,
-            target_port
-        );
+        let mut map = streams.lock().await;
 
-        println!("{} [INFO] Forwarding to {}", get_current_date(), target_addr);
+        match cmd {
+            0 => {
+                if payload.len() < 6 {
+                    let _ = tx.send(Message::Binary(Bytes::from_static(b"ERROR: CONNECT needs IP:port")));
+                    return Ok(());
+                }
 
-        let mut remote = match TcpStream::connect(&target_addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("{} [ERROR] Failed to connect to {}: {}", get_current_date(), target_addr, e);
-                return Ok(());
-            }
-        };
+                let target_ip = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let target_port = u16::from_be_bytes([payload[4], payload[5]]);
+                let initial_payload = &payload[6..];
 
-        if !payload.is_empty() {
-            if let Err(e) = remote.write_all(payload).await {
-                eprintln!("{} [ERROR] Failed to write payload to {}: {}", get_current_date(), target_addr, e);
-                return Ok(());
-            }
-        }
+                let target_addr = format!(
+                    "{}.{}.{}.{}:{}",
+                    (target_ip >> 24) & 0xff,
+                    (target_ip >> 16) & 0xff,
+                    (target_ip >> 8) & 0xff,
+                    target_ip & 0xff,
+                    target_port
+                );
 
-        let (mut remote_read, _remote_write) = remote.into_split();
-        let mut buf = [0u8; 8192];
+                println!("{} [INFO] [{}] CONNECT → {}", get_current_date(), stream_id, target_addr);
 
-        loop {
-            match remote_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(Message::Binary(Bytes::copy_from_slice(&buf[..n]))).is_err() {
-                        break;
+                let mut remote = match TcpStream::connect(&target_addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{} [ERROR] [{}] Connect failed: {}", get_current_date(), stream_id, e);
+                        let _ = tx.send(Message::Binary(Bytes::from(format!("ERROR: CONNECT_FAILED {}", e))));
+                        return Ok(());
                     }
+                };
+
+                let _ = remote.set_nodelay(true);
+
+                if !initial_payload.is_empty() {
+                    let _ = remote.write_all(initial_payload).await;
+                    let _ = remote.flush().await;
                 }
-                Err(e) => {
-                    eprintln!("{} [ERROR] Remote read error: {}", get_current_date(), e);
-                    break;
+
+                let (remote_read, remote_write) = remote.into_split();
+
+                let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<Bytes>();
+                map.insert(stream_id, stream_tx);
+
+                let tx_reader = tx.clone();
+                let sid = stream_id;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let mut reader = remote_read;
+
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let mut packet = Vec::with_capacity(5 + n);
+                                packet.extend_from_slice(&sid.to_be_bytes());
+                                packet.push(1); // DATA
+                                packet.extend_from_slice(&buf[0..n]);
+                                let _ = tx_reader.send(Message::Binary(Bytes::from(packet)));
+                            }
+                            Err(e) => {
+                                eprintln!("{} [ERROR] [{}] Remote read error: {}", get_current_date(), sid, e);
+                                break;
+                            }
+                        }
+                    }
+
+                    let mut close_packet = Vec::with_capacity(5);
+                    close_packet.extend_from_slice(&sid.to_be_bytes());
+                    close_packet.push(2); // CLOSE
+                    let _ = tx_reader.send(Message::Binary(Bytes::from(close_packet)));
+                });
+
+                tokio::spawn(async move {
+                    let mut writer = remote_write;
+                    while let Some(data) = stream_rx.recv().await {
+                        if let Err(e) = writer.write_all(&data).await {
+                            eprintln!("{} [ERROR] [{}] Remote write error: {}", get_current_date(), stream_id, e);
+                            break;
+                        }
+                        let _ = writer.flush().await;
+                    }
+                });
+            }
+
+            1 => {
+                if let Some(sender) = map.get(&stream_id) {
+                    let _ = sender.send(Bytes::copy_from_slice(payload));
+                } else {
+                    println!("{} [WARN] [{}] DATA to unknown stream", get_current_date(), stream_id);
                 }
             }
+
+            2 => {
+                println!("{} [INFO] [{}] CLOSE requested", get_current_date(), stream_id);
+                map.remove(&stream_id);
+            }
+
+            _ => println!("{} [WARN] Unknown command {} from stream {}", get_current_date(), cmd, stream_id),
         }
 
         Ok(())
